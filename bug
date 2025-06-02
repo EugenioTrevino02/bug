@@ -1,137 +1,96 @@
-#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-
-from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-from tf_transformations import euler_from_quaternion
-
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 import math
 
-class Bug0Node(Node):
+class Bug0Simple(Node):
     def __init__(self):
-        super().__init__('bug0_node')
+        super().__init__('bug0_simple_node')
 
-        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
-        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        # Publishers and subscribers
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
 
-        self.timer = self.create_timer(0.1, self.loop)
+        self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.state = 'GO_TO_GOAL'
-        self.scan = None
-        self.robot_x = 0.0
-        self.robot_y = 0.0
-        self.robot_yaw = 0.0  # in degrees
+        # Robot state
+        self.current_position = None
+        self.yaw = 0.0
+        self.scan_data = None
 
+        # Goal
         self.goal = (5.0, 5.0)
 
+        # Parameters
+        self.obstacle_distance_threshold = 0.6  # meters
+        self.linear_speed = 0.2
+        self.angular_speed = 0.5  # radians/sec
+        self.goal_tolerance = 0.3
+
     def odom_callback(self, msg):
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
-        orientation_q = msg.pose.pose.orientation
-        _, _, yaw = euler_from_quaternion([
-            orientation_q.x,
-            orientation_q.y,
-            orientation_q.z,
-            orientation_q.w
-        ])
-        self.robot_yaw = math.degrees(yaw)
+        # Get robot position
+        self.current_position = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y
+        )
 
-    def lidar_callback(self, msg):
-        self.scan = list(msg.ranges)
+        # Get robot yaw
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.yaw = math.atan2(siny_cosp, cosy_cosp)
 
-    def obstacle_ahead(self, threshold=0.6):
-        if not self.scan:
-            return False
-        front = self.scan[345:] + self.scan[:15]
-        return any(0.0 < d < threshold for d in front)
+    def scan_callback(self, msg):
+        self.scan_data = msg.ranges
 
-    def path_to_goal_clear(self, goal_angle, threshold=0.6):
-        if not self.scan:
-            return False
-        idx = int(goal_angle) % 360
-        margin = 10
-        indices = [(idx + i) % 360 for i in range(-margin, margin + 1)]
-        return all(self.scan[i] > threshold or self.scan[i] == 0.0 for i in indices)
-
-    def normalize_angle(self, angle):
-        while angle > 180:
-            angle -= 360
-        while angle < -180:
-            angle += 360
-        return angle
-
-    def compute_goal_angle(self):
-        dx = self.goal[0] - self.robot_x
-        dy = self.goal[1] - self.robot_y
-        return math.degrees(math.atan2(dy, dx))
-
-    def go_to_goal(self):
-        goal_angle = self.compute_goal_angle()
-        error = self.normalize_angle(goal_angle - self.robot_yaw)
+    def control_loop(self):
+        if self.current_position is None or self.scan_data is None:
+            return
 
         twist = Twist()
-        twist.linear.x = 0.3
-        twist.angular.z = math.radians(error * 0.5)
-        self.publisher.publish(twist)
 
-    def follow_obstacle(self):
-        twist = Twist()
-        front = self.scan[0]
-        right = self.scan[270]
+        # Check if goal reached
+        dx = self.goal[0] - self.current_position[0]
+        dy = self.goal[1] - self.current_position[1]
+        distance_to_goal = math.hypot(dx, dy)
 
-        if front < 0.5 and front > 0.0:
-            twist.angular.z = 0.5
-        elif right > 0.6 or right == 0.0:
-            twist.linear.x = 0.2
-            twist.angular.z = -0.3
+        if distance_to_goal < self.goal_tolerance:
+            self.get_logger().info("🎯 Goal reached!")
+            self.cmd_vel_pub.publish(twist)  # Stop
+            return
+
+        # Compute angle to goal
+        angle_to_goal = math.atan2(dy, dx)
+        angle_error = angle_to_goal - self.yaw
+        angle_error = math.atan2(math.sin(angle_error), math.cos(angle_error))  # Normalize
+
+        # Check for obstacle in front 180°
+        front_ranges = list(self.scan_data[0:90]) + list(self.scan_data[270:360])
+        obstacle_ahead = any(r < self.obstacle_distance_threshold for r in front_ranges)
+
+        if obstacle_ahead:
+            # Turn right in place
+            twist.linear.x = 0.0
+            twist.angular.z = -self.angular_speed
         else:
-            twist.linear.x = 0.2
+            # Go toward goal
+            twist.linear.x = self.linear_speed
 
-        self.publisher.publish(twist)
+            # Clamp angular.z to limit
+            max_angular = 1.0
+            twist.angular.z = max(-max_angular, min(max_angular, angle_error))
 
-    def at_goal(self):
-        dx = self.goal[0] - self.robot_x
-        dy = self.goal[1] - self.robot_y
-        return math.hypot(dx, dy) < 0.3
-
-    def loop(self):
-        if self.scan is None:
-            return
-
-        if self.at_goal():
-            self.get_logger().info("Goal reached!")
-            self.publisher.publish(Twist())
-            return
-
-        goal_angle = self.compute_goal_angle()
-
-        if self.state == "GO_TO_GOAL":
-            if self.obstacle_ahead():
-                self.get_logger().info("Obstacle ahead, switching to FOLLOW_OBSTACLE")
-                self.state = "FOLLOW_OBSTACLE"
-            else:
-                self.go_to_goal()
-
-        elif self.state == "FOLLOW_OBSTACLE":
-            if self.path_to_goal_clear(goal_angle):
-                self.get_logger().info("Path to goal clear, switching to GO_TO_GOAL")
-                self.state = "GO_TO_GOAL"
-            else:
-                self.follow_obstacle()
+        self.cmd_vel_pub.publish(twist)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = Bug0Node()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    node = Bug0Simple()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
