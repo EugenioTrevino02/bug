@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import rospy
+import math
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from tf.transformations import euler_from_quaternion
+
+class Bug0Node:
+    def __init__(self):
+        rospy.init_node('bug0_node')
+
+        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        rospy.Subscriber('/scan', LaserScan, self.lidar_callback)
+        rospy.Subscriber('/odom', Odometry, self.odom_callback)
+
+        self.state = "GO_TO_GOAL"
+        self.scan = None
+
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
+
+        self.goal = (5.0, 5.0)  # (x, y)
+
+        self.rate = rospy.Rate(10)
+
+    def odom_callback(self, msg):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+        orientation_q = msg.pose.pose.orientation
+        _, _, self.robot_yaw = euler_from_quaternion([
+            orientation_q.x,
+            orientation_q.y,
+            orientation_q.z,
+            orientation_q.w
+        ])
+        self.robot_yaw = math.degrees(self.robot_yaw)
+
+    def lidar_callback(self, msg):
+        self.scan = list(msg.ranges)
+
+    def obstacle_ahead(self, threshold=0.6):
+        if self.scan is None:
+            return False
+        front = self.scan[345:] + self.scan[:15]
+        return any(d < threshold for d in front if d > 0)
+
+    def path_to_goal_clear(self, goal_angle, threshold=0.6):
+        if self.scan is None:
+            return False
+        idx = int(goal_angle) % 360
+        margin = 10
+        indices = [(idx + i) % 360 for i in range(-margin, margin + 1)]
+        return all(self.scan[i] > threshold or self.scan[i] == 0.0 for i in indices)
+
+    def normalize_angle(self, angle):
+        while angle > 180: angle -= 360
+        while angle < -180: angle += 360
+        return angle
+
+    def compute_goal_angle(self):
+        dx = self.goal[0] - self.robot_x
+        dy = self.goal[1] - self.robot_y
+        return math.degrees(math.atan2(dy, dx))
+
+    def go_to_goal(self):
+        goal_angle = self.compute_goal_angle()
+        error = self.normalize_angle(goal_angle - self.robot_yaw)
+        twist = Twist()
+        twist.linear.x = 0.3
+        twist.angular.z = math.radians(error * 0.5)  # Proportional turn
+        self.cmd_pub.publish(twist)
+
+    def follow_obstacle(self):
+        twist = Twist()
+        front = self.scan[0]
+        right = self.scan[270]
+
+        if front < 0.5:
+            twist.angular.z = 0.5  # turn left
+        elif right > 0.6 or right == 0.0:
+            twist.linear.x = 0.2
+            twist.angular.z = -0.3  # turn right
+        else:
+            twist.linear.x = 0.2  # go straight
+        self.cmd_pub.publish(twist)
+
+    def at_goal(self):
+        dx = self.goal[0] - self.robot_x
+        dy = self.goal[1] - self.robot_y
+        return math.hypot(dx, dy) < 0.3
+
+    def run(self):
+        while not rospy.is_shutdown():
+            if self.scan is None:
+                self.rate.sleep()
+                continue
+
+            if self.at_goal():
+                self.cmd_pub.publish(Twist())  # stop
+                rospy.loginfo("Goal reached!")
+                break
+
+            goal_angle = self.compute_goal_angle()
+
+            if self.state == "GO_TO_GOAL":
+                if self.obstacle_ahead():
+                    self.state = "FOLLOW_OBSTACLE"
+                    rospy.loginfo("Obstacle ahead, switching to FOLLOW_OBSTACLE")
+                else:
+                    self.go_to_goal()
+
+            elif self.state == "FOLLOW_OBSTACLE":
+                if self.path_to_goal_clear(goal_angle):
+                    self.state = "GO_TO_GOAL"
+                    rospy.loginfo("Path to goal clear, switching to GO_TO_GOAL")
+                else:
+                    self.follow_obstacle()
+
+            self.rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        node = Bug0Node()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
